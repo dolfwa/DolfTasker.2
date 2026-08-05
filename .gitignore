@@ -21,3 +21,7 @@ desktop.ini
 .env.*
 *.pfx
 *.pem
+
+# macOS build output
+mac/build/
+.DS_Store

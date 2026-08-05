@@ -1,0 +1,10 @@
+# The repo is authored on Windows but the mac/ tree is consumed on macOS.
+# Shell scripts must keep LF endings or the shebang becomes "#!/bin/bash\r",
+# which fails with "bad interpreter".
+*.sh        text eol=lf
+*.swift     text eol=lf
+
+# Windows-side sources stay CRLF.
+*.bat       text eol=crlf
+*.cs        text eol=crlf
+*.manifest  text eol=crlf
