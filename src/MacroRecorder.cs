@@ -178,6 +178,70 @@ namespace DolfTask
 
         [DllImport("winmm.dll")]
         public static extern uint timeEndPeriod(uint uPeriod);
+
+        #region Windows / foreground
+
+        public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+        public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+        public const int SW_RESTORE = 9;
+
+        public delegate void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+                                          int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+                                                    WinEventProc lpfnWinEventProc, uint idProcess,
+                                                    uint idThread, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+        public const uint GA_ROOT = 2;
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+
+        #endregion
     }
 
     #endregion
@@ -190,7 +254,12 @@ namespace DolfTask
         MouseButton = 1, // a = MOUSEEVENTF_* flag, b = mouseData (X button index)
         MouseWheel = 2,  // a = MOUSEEVENTF_WHEEL/HWHEEL, b = signed delta
         KeyDown = 3,     // a = vk, b = scan code, c = 1 if extended key
-        KeyUp = 4
+        KeyUp = 4,
+        /// <summary>
+        /// Brings a window to the foreground. Process = executable name,
+        /// Title = window caption at record time, a = settle delay in ms.
+        /// </summary>
+        ActivateWindow = 5
     }
 
     internal struct MacroEvent
@@ -199,22 +268,37 @@ namespace DolfTask
         public int Delay; // milliseconds to wait before this event
         public int A, B, C;
 
+        // Only used by ActivateWindow. Window handles aren't stable across
+        // sessions, so the target is re-found by name at playback.
+        public string Process;
+        public string Title;
+
         public MacroEvent(EvKind kind, int delay, int a, int b, int c)
         {
             Kind = kind; Delay = delay; A = a; B = b; C = c;
+            Process = null; Title = null;
+        }
+
+        public static MacroEvent Activate(int delay, string process, string title, int settleMs)
+        {
+            var e = new MacroEvent(EvKind.ActivateWindow, delay, settleMs, 0, 0);
+            e.Process = process;
+            e.Title = title;
+            return e;
         }
     }
 
     internal static class MacroFile
     {
-        private const uint Magic = 0x314B5444; // "DTK1"
+        private const uint MagicV1 = 0x314B5444; // "DTK1" — no window targets
+        private const uint MagicV2 = 0x324B5444; // "DTK2" — adds ActivateWindow
 
         public static void Save(string path, List<MacroEvent> events)
         {
             using (var fs = File.Create(path))
             using (var w = new BinaryWriter(fs))
             {
-                w.Write(Magic);
+                w.Write(MagicV2);
                 w.Write(events.Count);
                 foreach (var e in events)
                 {
@@ -223,6 +307,8 @@ namespace DolfTask
                     w.Write(e.A);
                     w.Write(e.B);
                     w.Write(e.C);
+                    w.Write(e.Process ?? "");
+                    w.Write(e.Title ?? "");
                 }
             }
         }
@@ -232,8 +318,11 @@ namespace DolfTask
             using (var fs = File.OpenRead(path))
             using (var r = new BinaryReader(fs))
             {
-                if (r.ReadUInt32() != Magic)
+                uint magic = r.ReadUInt32();
+                if (magic != MagicV1 && magic != MagicV2)
                     throw new InvalidDataException("Not a Dolftasker.2 recording (.rec) file.");
+                bool hasTargets = magic == MagicV2;
+
                 int count = r.ReadInt32();
                 if (count < 0) throw new InvalidDataException("Corrupt recording file.");
                 var list = new List<MacroEvent>(count);
@@ -244,10 +333,129 @@ namespace DolfTask
                     int a = r.ReadInt32();
                     int b = r.ReadInt32();
                     int c = r.ReadInt32();
-                    list.Add(new MacroEvent(kind, delay, a, b, c));
+                    var e = new MacroEvent(kind, delay, a, b, c);
+                    if (hasTargets)
+                    {
+                        // Older files simply have no window steps to carry.
+                        string process = r.ReadString();
+                        string title = r.ReadString();
+                        e.Process = process.Length == 0 ? null : process;
+                        e.Title = title.Length == 0 ? null : title;
+                    }
+                    list.Add(e);
                 }
                 return list;
             }
+        }
+    }
+
+    #endregion
+
+    #region Windows
+
+    /// <summary>
+    /// Finding and focusing top-level windows by name. Handles change every
+    /// session, so a recorded step stores what the window *is*, not its HWND.
+    /// </summary>
+    internal static class WindowTools
+    {
+        public static string ProcessNameOf(IntPtr hwnd)
+        {
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0) return null;
+            try
+            {
+                using (var p = Process.GetProcessById((int)pid))
+                    return p.ProcessName;
+            }
+            catch { return null; }
+        }
+
+        public static string TitleOf(IntPtr hwnd)
+        {
+            var sb = new System.Text.StringBuilder(512);
+            int length = Native.GetWindowTextW(hwnd, sb, sb.Capacity);
+            return length > 0 ? sb.ToString() : "";
+        }
+
+        public static bool IsOwnWindow(IntPtr hwnd)
+        {
+            uint pid;
+            Native.GetWindowThreadProcessId(hwnd, out pid);
+            return pid == (uint)Process.GetCurrentProcess().Id;
+        }
+
+        /// <summary>
+        /// Best visible top-level window for a recorded target. The process name is
+        /// the strong signal — a game's caption changes, its executable doesn't.
+        /// </summary>
+        public static IntPtr Find(string process, string title)
+        {
+            IntPtr best = IntPtr.Zero;
+            int bestScore = 0;
+
+            Native.EnumWindows((hwnd, _) =>
+            {
+                if (!Native.IsWindowVisible(hwnd)) return true;
+
+                string windowTitle = TitleOf(hwnd);
+                string windowProcess = ProcessNameOf(hwnd);
+                if (string.IsNullOrEmpty(windowTitle) && string.IsNullOrEmpty(windowProcess)) return true;
+
+                int score = 0;
+                if (!string.IsNullOrEmpty(process) && !string.IsNullOrEmpty(windowProcess)
+                    && string.Equals(process, windowProcess, StringComparison.OrdinalIgnoreCase))
+                    score += 100;
+
+                if (!string.IsNullOrEmpty(title) && !string.IsNullOrEmpty(windowTitle))
+                {
+                    if (string.Equals(title, windowTitle, StringComparison.OrdinalIgnoreCase)) score += 50;
+                    else if (windowTitle.IndexOf(title, StringComparison.OrdinalIgnoreCase) >= 0) score += 20;
+                    else if (title.IndexOf(windowTitle, StringComparison.OrdinalIgnoreCase) >= 0) score += 10;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = hwnd;
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            return best;
+        }
+
+        /// <summary>
+        /// Windows only lets the foreground process change focus freely, so borrow
+        /// the current foreground thread's input state for the call.
+        /// </summary>
+        public static bool Activate(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (Native.IsIconic(hwnd)) Native.ShowWindow(hwnd, Native.SW_RESTORE);
+
+            IntPtr foreground = Native.GetForegroundWindow();
+            if (foreground == hwnd) return true;
+
+            uint foregroundThread = 0;
+            if (foreground != IntPtr.Zero)
+            {
+                uint pid;
+                foregroundThread = Native.GetWindowThreadProcessId(foreground, out pid);
+            }
+            uint ownThread = Native.GetCurrentThreadId();
+
+            bool attached = false;
+            if (foregroundThread != 0 && foregroundThread != ownThread)
+                attached = Native.AttachThreadInput(ownThread, foregroundThread, true);
+
+            bool ok = Native.SetForegroundWindow(hwnd);
+
+            if (attached)
+                Native.AttachThreadInput(ownThread, foregroundThread, false);
+
+            return ok;
         }
     }
 
@@ -356,7 +564,26 @@ namespace DolfTask
                     SendKey(e, true);
                     _keysDown.Remove(e.A);
                     break;
+                case EvKind.ActivateWindow:
+                    Activate(e);
+                    break;
             }
+        }
+
+        /// <summary>
+        /// Focuses the recorded window, then waits for it to actually come forward.
+        /// Without the settle the next click arrives while the old window still has
+        /// focus and gets spent on the switch instead of reaching the app.
+        /// </summary>
+        private void Activate(MacroEvent e)
+        {
+            IntPtr hwnd = WindowTools.Find(e.Process, e.Title);
+            if (hwnd == IntPtr.Zero) return;   // window isn't open; later steps still run
+
+            WindowTools.Activate(hwnd);
+
+            int settle = e.A > 0 ? e.A : 120;
+            if (_speed > 0) PreciseSleep(settle);
         }
 
         private static void SendMouse(uint flags, uint data, int x, int y, bool absolute = true)
@@ -435,8 +662,10 @@ namespace DolfTask
         private const int VK_F10 = 0x79;
         private const int VK_ESCAPE = 0x1B;
 
-        private IntPtr _mouseHook, _keyboardHook;
+        private IntPtr _mouseHook, _keyboardHook, _foregroundHook;
         private Native.HookProc _mouseProc, _keyboardProc; // kept alive against the GC
+        private Native.WinEventProc _foregroundProc;
+        private string _lastActivatedProcess;
         private readonly Stopwatch _clock = new Stopwatch();
         private long _lastEventTime;
 
@@ -453,7 +682,7 @@ namespace DolfTask
         private int _speedIndex = 1;
         private static readonly string[] SpeedNames = { "0.5x", "1x", "2x", "4x", "Max" };
         private string SpeedLabel() { return SpeedNames[_speedIndex] + "   ▾"; }
-        private CheckBox _chkMoves, _chkTopMost, _chkScanCodes;
+        private CheckBox _chkMoves, _chkTopMost, _chkScanCodes, _chkWindows;
         private Panel _pnlStatus, _pnlProgress;
         private Label _lblStatus, _lblMeta, _lblInfo;
         private System.Windows.Forms.Timer _blink;
@@ -564,15 +793,17 @@ namespace DolfTask
             y += playback.Height + gap;
 
             // Capture
-            var capture = Dw.Group("Capture", pad, y, content, 88);
+            var capture = Dw.Group("Capture", pad, y, content, 110);
             Controls.Add(capture);
 
             _chkMoves = Dw.Check("Record mouse movement", 10, 18, content - 24, true);
             capture.Controls.Add(_chkMoves);
-            _chkTopMost = Dw.Check("Always on top", 10, 40, content - 24, true);
+            _chkWindows = Dw.Check("Record window switches", 10, 40, content - 24, true);
+            capture.Controls.Add(_chkWindows);
+            _chkTopMost = Dw.Check("Always on top", 10, 62, content - 24, true);
             _chkTopMost.CheckedChanged += (s, e) => TopMost = _chkTopMost.Checked;
             capture.Controls.Add(_chkTopMost);
-            _chkScanCodes = Dw.Check("Game mode (scan codes)", 10, 62, content - 24, false);
+            _chkScanCodes = Dw.Check("Game mode (scan codes)", 10, 84, content - 24, false);
             capture.Controls.Add(_chkScanCodes);
 
             y += capture.Height + gap;
@@ -706,6 +937,37 @@ namespace DolfTask
             IntPtr module = Native.GetModuleHandle(null);
             _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, module, 0);
             _keyboardHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _keyboardProc, module, 0);
+
+            // Fires the moment the foreground window changes, which is what a click
+            // on an unfocused window really does before the app ever sees it.
+            _foregroundProc = ForegroundChanged;
+            _foregroundHook = Native.SetWinEventHook(
+                Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero, _foregroundProc, 0, 0,
+                Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+        }
+
+        private void ForegroundChanged(IntPtr hook, uint eventType, IntPtr hwnd,
+                                       int idObject, int idChild, uint thread, uint time)
+        {
+            if (!_recording || hwnd == IntPtr.Zero) return;
+            if (!_chkWindows.Checked) return;
+            if (idObject != 0) return;                      // OBJID_WINDOW only
+
+            IntPtr root = Native.GetAncestor(hwnd, Native.GA_ROOT);
+            if (root == IntPtr.Zero) root = hwnd;
+            if (WindowTools.IsOwnWindow(root)) return;      // ignore our own window
+
+            string process = WindowTools.ProcessNameOf(root);
+            string title = WindowTools.TitleOf(root);
+            if (string.IsNullOrEmpty(process) && string.IsNullOrEmpty(title)) return;
+
+            // Alt-tabbing back and forth can fire repeatedly for the same app.
+            if (string.Equals(process, _lastActivatedProcess, StringComparison.OrdinalIgnoreCase)) return;
+            _lastActivatedProcess = process;
+
+            _events.Add(MacroEvent.Activate(NextDelay(), process, title, 120));
+            UpdateUi();
         }
 
         private void RegisterHotkeys()
@@ -871,6 +1133,8 @@ namespace DolfTask
                 _currentFile = null;
                 _lastRecordedPos = new Point(int.MinValue, int.MinValue);
                 _lastEventTime = 0;
+                // The first switch away from DolfTasker should always be captured.
+                _lastActivatedProcess = null;
                 _clock.Restart();
                 _recording = true;
             }
@@ -1010,6 +1274,7 @@ namespace DolfTask
             Native.UnregisterHotKey(Handle, HOTKEY_PLAY);
             if (_mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_mouseHook);
             if (_keyboardHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_keyboardHook);
+            if (_foregroundHook != IntPtr.Zero) Native.UnhookWinEvent(_foregroundHook);
             base.OnFormClosing(e);
         }
     }
@@ -1024,6 +1289,7 @@ namespace DolfTask
         public const string HWheel = "Wheel (horiz)";
         public const string KeyDown = "Key Down";
         public const string KeyUp = "Key Up";
+        public const string Activate = "Activate Window";
 
         public static readonly string[] All =
         {
@@ -1034,7 +1300,8 @@ namespace DolfTask
             "X1 Down", "X1 Up",
             "X2 Down", "X2 Up",
             Wheel, HWheel,
-            KeyDown, KeyUp
+            KeyDown, KeyUp,
+            Activate
         };
 
         public static string Of(MacroEvent e)
@@ -1044,6 +1311,7 @@ namespace DolfTask
                 case EvKind.MouseMove: return Move;
                 case EvKind.KeyDown: return KeyDown;
                 case EvKind.KeyUp: return KeyUp;
+                case EvKind.ActivateWindow: return Activate;
                 case EvKind.MouseWheel:
                     return (uint)e.A == Native.MOUSEEVENTF_HWHEEL ? HWheel : Wheel;
                 case EvKind.MouseButton:
@@ -1071,6 +1339,7 @@ namespace DolfTask
                 case Move: e.Kind = EvKind.MouseMove; break;
                 case KeyDown: e.Kind = EvKind.KeyDown; break;
                 case KeyUp: e.Kind = EvKind.KeyUp; break;
+                case Activate: e.Kind = EvKind.ActivateWindow; break;
                 case Wheel: e.Kind = EvKind.MouseWheel; e.A = (int)Native.MOUSEEVENTF_WHEEL; break;
                 case HWheel: e.Kind = EvKind.MouseWheel; e.A = (int)Native.MOUSEEVENTF_HWHEEL; break;
                 default:
@@ -1096,6 +1365,7 @@ namespace DolfTask
         public static bool IsMove(string n) { return n == Move; }
         public static bool IsKey(string n) { return n == KeyDown || n == KeyUp; }
         public static bool IsWheel(string n) { return n == Wheel || n == HWheel; }
+        public static bool IsActivate(string n) { return n == Activate; }
     }
 
     internal static class KeyInfo
@@ -1307,6 +1577,7 @@ namespace DolfTask
             _grid.Columns.Add(_colKey);
 
             AddTextColumn("wheel", "WHEEL", 84, false, right: true);
+            AddTextColumn("target", "WINDOW", 150, false);
             var wait = AddTextColumn("wait", "WAIT MS", 100, false, right: true);
             wait.DefaultCellStyle.ForeColor = Dw.Ink;
             wait.DefaultCellStyle.Font = Dw.MonoBold;
@@ -1398,6 +1669,11 @@ namespace DolfTask
             {
                 row.Cells["wheel"].Value = e.B;
             }
+            else if (e.Kind == EvKind.ActivateWindow)
+            {
+                row.Cells["target"].Value = e.Process ?? e.Title ?? "";
+                row.Cells["target"].ToolTipText = e.Title ?? "";
+            }
 
             StyleRow(row);
         }
@@ -1410,6 +1686,7 @@ namespace DolfTask
             SetEnabled(row.Cells["y"], ActionNames.IsMove(action));
             SetEnabled(row.Cells["key"], ActionNames.IsKey(action));
             SetEnabled(row.Cells["wheel"], ActionNames.IsWheel(action));
+            SetEnabled(row.Cells["target"], ActionNames.IsActivate(action));
         }
 
         private static void SetEnabled(DataGridViewCell cell, bool enabled)
@@ -1436,6 +1713,8 @@ namespace DolfTask
                     row.Cells["key"].Value = "A";
                 if (ActionNames.IsWheel(action) && IsBlank(row.Cells["wheel"].Value))
                     row.Cells["wheel"].Value = 120;
+                if (ActionNames.IsActivate(action) && IsBlank(row.Cells["target"].Value))
+                    row.Cells["target"].Value = "RobloxPlayerBeta";
                 if (ActionNames.IsMove(action))
                 {
                     if (IsBlank(row.Cells["x"].Value)) row.Cells["x"].Value = 0;
@@ -1563,6 +1842,17 @@ namespace DolfTask
                 else if (ev.Kind == EvKind.MouseWheel)
                 {
                     ev.B = ReadInt(row.Cells["wheel"].Value, 120);
+                }
+                else if (ev.Kind == EvKind.ActivateWindow)
+                {
+                    string target = Convert.ToString(row.Cells["target"].Value);
+                    if (target == NotApplicable) target = "";
+                    ev.Process = target.Length == 0 ? null : target.Trim();
+                    // Keep the recorded caption only while the target is unchanged.
+                    ev.Title = (original.Kind == EvKind.ActivateWindow
+                                && string.Equals(original.Process, ev.Process, StringComparison.OrdinalIgnoreCase))
+                               ? original.Title : null;
+                    ev.A = original.Kind == EvKind.ActivateWindow && original.A > 0 ? original.A : 120;
                 }
                 else if (ev.Kind == EvKind.KeyDown || ev.Kind == EvKind.KeyUp)
                 {

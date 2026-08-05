@@ -68,6 +68,8 @@ Options:
 - **Speed** — click to cycle `0.5x` → `1x` → `2x` → `4x` → `Max` (no delays).
 - **Record mouse movement** — off records only clicks (each click still lands at
   the right spot), which makes for much smaller, more robust macros.
+- **Record window switches** — captures an **Activate Window** step whenever you
+  switch apps while recording. See below.
 - **Always on top** — keeps the window visible over the app you're automating.
 - **Game mode (scan codes)** — sends keys as hardware scan codes instead of
   virtual key codes. Many games and remote-desktop clients ignore normal
@@ -76,17 +78,45 @@ Options:
 **Open…** / **Save…** read and write `.rec` files, so you can keep a library of
 macros and reuse them later.
 
+## Switching windows (games, and anything else)
+
+Clicking an unfocused window makes that click do two jobs: it changes the
+foreground window *and* it reaches the app. Games are the worst case — the click
+that brings the game forward is swallowed by the focus change, so on playback the
+macro is one click short and everything after it lands in the wrong place.
+
+DolfTasker records the focus change as its own step, so the click no longer has
+to carry it:
+
+| # | Action | Window | Wait ms |
+|---|---|---|---|
+| 1 | Activate Window | RobloxPlayerBeta | 0 |
+| 2 | Mouse Move | | 40 |
+| 3 | Left Down | | 50 |
+
+On playback the **Activate Window** step brings the target forward and waits
+~120 ms for it to actually get focus, so the click that follows is a real
+in-game click.
+
+The target is stored as the **executable name**, not a window handle or caption —
+handles change every session and a game's title bar changes with the place you're
+in, but `RobloxPlayerBeta` stays put. You can retype the target in the Actions
+window, or add an **Activate Window** step by hand to switch apps mid-macro.
+
+If the window isn't open at playback time the step is skipped and the rest of the
+macro still runs.
+
 ## Editing a macro — the Actions window
 
 **Actions…** opens the recorded steps in a spreadsheet-style list, so the main
 window stays small and you only see the detail when you ask for it.
 
-| # | Action | X | Y | Key | Wheel | Wait ms |
-|---|---|---|---|---|---|---|
-| 1 FIRST | Mouse Move | 640 | 480 | — | — | 0 |
-| 2 | Left Down | — | — | — | — | 50 |
-| 3 | Left Up | — | — | — | — | 80 |
-| 4 LAST | Key Down | — | — | A | — | 120 |
+| # | Action | X | Y | Key | Wheel | Window | Wait ms |
+|---|---|---|---|---|---|---|---|
+| 1 FIRST | Activate Window | — | — | — | — | RobloxPlayerBeta | 0 |
+| 2 | Mouse Move | 640 | 480 | — | — | — | 40 |
+| 3 | Left Down | — | — | — | — | — | 50 |
+| 4 LAST | Key Down | — | — | A | — | — | 120 |
 
 Every cell is editable in place. Cells that don't apply to a row read `—` and
 can't be edited, so a key row can't be given coordinates by accident.
