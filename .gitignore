@@ -1,0 +1,23 @@
+# Build output
+bin/
+obj/
+*.exe
+*.pdb
+*.dll
+
+# Claude Code local settings (machine-specific, not project config)
+.claude/settings.local.json
+
+# Editor / OS cruft
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# Secrets
+.env
+.env.*
+*.pfx
+*.pem
